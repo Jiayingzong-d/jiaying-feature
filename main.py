@@ -1,72 +1,70 @@
-# main.py
-# Author: Jiaying Zong
-# Function: Read camera input → Detect hand position → Send OSC to TouchDesigner
-
 import cv2
 import mediapipe as mp
-from pythonosc import udp_client
-import time
-from collections import deque
 import numpy as np
 
-# ============ 初始化部分 ============
-# OSC 连接到 TD（端口可让队友确认）
+from pythonosc import udp_client
 client = udp_client.SimpleUDPClient("127.0.0.1", 8000)
+# =======================================
 
-# 初始化摄像头（0为默认摄像头）
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-if not cap.isOpened():
-    print(" 无法打开摄像头，请检查设置。")
-    exit()
-
+mp_drawing = mp.solutions.drawing_utils
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
-mp_draw = mp.solutions.drawing_utils
 
-# 平滑缓存队列（防止抖动）
-smooth_x = deque(maxlen=5)
-smooth_y = deque(maxlen=5)
+# 打开摄像头，0 是默认摄像头
+cap = cv2.VideoCapture(0)
 
-print(" 系统初始化完成。按 Q 退出。")
-print("🔗 发送到: 127.0.0.1:8000 | 地址路径: /handpos [x, y]")
+# 这里可以调参数：max_num_hands=1 只追一只手
+with mp_hands.Hands(
+        max_num_hands=1,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5) as hands:
 
-# ============  主循环 ============
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print(" 无法读取摄像头帧。")
-        break
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            print("⚠️ 没有捕获到摄像头画面")
+            break
 
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(frame_rgb)
+        # OpenCV 读进来是 BGR，需要先转成 RGB 给 Mediapipe 用
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image.flags.writeable = False
+        results = hands.process(image)
 
-    if results.multi_hand_landmarks:
-        for handLms in results.multi_hand_landmarks:
-            h, w, c = frame.shape
-            x_sum, y_sum, count = 0, 0, 0
-            for lm in handLms.landmark:
-                x_sum += lm.x
-                y_sum += lm.y
-                count += 1
-            x_avg = x_sum / count
-            y_avg = y_sum / count
+        # 再转回 BGR，用来显示
+        image.flags.writeable = True
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-            # 平滑化
-            smooth_x.append(x_avg)
-            smooth_y.append(y_avg)
-            x_smooth = np.mean(smooth_x)
-            y_smooth = np.mean(smooth_y)
+        hand_center = None
 
-            # 发送 OSC
-            client.send_message("/handpos", [float(x_smooth), float(y_smooth)])
-            print(f"📤 Sent to TD: /handpos [{x_smooth:.2f}, {y_smooth:.2f}]")
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                # 画关键点和骨架
+                mp_drawing.draw_landmarks(
+                    image, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
-            # 可视化手部
-            mp_draw.draw_landmarks(frame, handLms, mp_hands.HAND_CONNECTIONS)
+                # 计算手的平均坐标（归一化 0~1）
+                xs = [lm.x for lm in hand_landmarks.landmark]
+                ys = [lm.y for lm in hand_landmarks.landmark]
+                cx, cy = float(np.mean(xs)), float(np.mean(ys))
+                hand_center = (cx, cy)
 
-    cv2.imshow("Camera → OSC (TD Bridge)", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+                # 在图像上画一个圆点
+                h, w, _ = image.shape
+                px, py = int(cx * w), int(cy * h)
+                cv2.circle(image, (px, py), 10, (0, 255, 0), -1)
+
+                # 显示坐标文字
+                cv2.putText(image, f"x:{cx:.2f} y:{cy:.2f}",
+                            (px + 10, py - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                # ===== 如果你之后想发 OSC 给 UE，可以在这里加 =====
+                client.send_message("/handpos", [cx, cy])
+
+        cv2.imshow('Hand Tracking (Pure Python)', image)
+
+        # 按 q 退出
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
 cap.release()
 cv2.destroyAllWindows()
